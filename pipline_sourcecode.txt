@@ -1,0 +1,263 @@
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.Random;
+
+/**
+ * City Water Pipeline Pressure & Leak Detection Sentinel
+ *
+ * Run (Java 11+, no compile step needed):  java PipelineSentinel.java          -> burst scenario
+ *                                          java PipelineSentinel.java normal   -> no-leak scenario
+ * Or:  javac PipelineSentinel.java && java PipelineSentinel [normal]
+ */
+public class PipelineSentinel {
+
+    static final long START = System.currentTimeMillis();
+
+    /** Thread-safe, timestamped console logger. */
+    static synchronized void log(String msg) {
+        System.out.printf("[t=%5dms][%-14s] %s%n",
+                System.currentTimeMillis() - START, Thread.currentThread().getName(), msg);
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        boolean normalOnly = args.length > 0 && args[0].equalsIgnoreCase("normal");
+
+        PipelineSegment segment = new PipelineSegment("SEG-A7 (Main St -> 5th Ave)");
+        PipelineMonitor monitor = new PipelineMonitor(segment);
+
+        ValveActuatorThread actuator = new ValveActuatorThread(monitor, segment);
+        // fracture occurs at reading #10 (after ~2 s of normal flow); -1 = never
+        PressureSensorThread sensor = new PressureSensorThread(monitor, normalOnly ? -1 : 10, 16);
+
+        log("=== Pipeline Sentinel starting: " + segment.getId() + " ===");
+        actuator.start();   // starts first so it is already waiting
+        Thread.sleep(100);
+        sensor.start();
+
+        sensor.join();
+        actuator.join();
+
+        log("=== FINAL STATE === " + segment);
+        if (monitor.isEmergency()) {
+            long ms = actuator.getIsolationTimeMs();
+            log("Detection -> valve fully closed: " + ms + " ms  "
+                    + (ms <= 500 ? "[PASS: within 500 ms]" : "[FAIL: exceeded 500 ms]"));
+        } else {
+            log("No emergency occurred; system stayed in normal operation.");
+        }
+    }
+}
+
+/** Custom checked exception: thrown when the pressure gradient exceeds structural limits. */
+class PipelineBurstException extends Exception {
+    private final String segmentId;
+    private final double pressureDropBar;
+    private final long windowMs;
+
+    public PipelineBurstException(String segmentId, double pressureDropBar, long windowMs, String message) {
+        super(message);
+        this.segmentId = segmentId;
+        this.pressureDropBar = pressureDropBar;
+        this.windowMs = windowMs;
+    }
+    public String getSegmentId()      { return segmentId; }
+    public double getPressureDropBar() { return pressureDropBar; }
+    public long getWindowMs()         { return windowMs; }
+}
+
+/** Data model. All fields private (encapsulation); every access is synchronized and validated. */
+class PipelineSegment {
+    private final String id;
+    private double inletPressure  = 5.2;   // bar
+    private double outletPressure = 5.1;   // bar
+    private int valveOpenPercent  = 100;   // 0..100
+    private boolean isolated = false;
+
+    public PipelineSegment(String id) { this.id = id; }
+
+    public String getId() { return id; }
+
+    public synchronized void updatePressures(double inlet, double outlet) {
+        if (inlet < 0 || outlet < 0) throw new IllegalArgumentException("Pressure cannot be negative");
+        this.inletPressure = inlet;
+        this.outletPressure = outlet;
+    }
+    public synchronized double getInletPressure()  { return inletPressure; }
+    public synchronized double getOutletPressure() { return outletPressure; }
+    public synchronized double getDifferential()   { return inletPressure - outletPressure; }
+    public synchronized int getValveOpenPercent()  { return valveOpenPercent; }
+    public synchronized boolean isIsolated()       { return isolated; }
+
+    public synchronized void setValveOpenPercent(int pct) {
+        if (pct < 0 || pct > 100) throw new IllegalArgumentException("Valve % must be 0..100");
+        this.valveOpenPercent = pct;
+        if (pct == 0) this.isolated = true;
+    }
+
+    @Override
+    public synchronized String toString() {
+        return String.format("%s | inlet=%.2f bar, outlet=%.2f bar, valve=%d%%, isolated=%b",
+                id, inletPressure, outletPressure, valveOpenPercent, isolated);
+    }
+}
+
+/**
+ * Shared monitor. Sensor thread calls checkPressure(); actuator thread blocks in awaitEmergency()
+ * using wait(), and is woken by notifyAll() inside triggerEmergencyIsolation().
+ */
+class PipelineMonitor {
+    static final double MAX_DROP_BAR     = 4.5;   // spec: > 4.5 bar drop ...
+    static final long   WINDOW_MS        = 2000;  // ... within 2 seconds
+    static final double CRITICAL_FLOOR   = 2.0;   // fracture rule: outlet below this ...
+    static final double SUDDEN_DROP_BAR  = 3.0;   // ... after a drop of at least this much in the window
+
+    private final PipelineSegment segment;
+    private final Deque<double[]> window = new ArrayDeque<>();  // {timestampMs, outletBar}
+    private boolean emergency = false;
+    private boolean shutdown  = false;
+    private long detectedAtNanos;
+    private String reason = "";
+
+    public PipelineMonitor(PipelineSegment segment) { this.segment = segment; }
+
+    /** Records a reading, evaluates the gradient, and throws if the limits are breached. */
+    public synchronized void checkPressure(double inlet, double outlet) throws PipelineBurstException {
+        long now = System.currentTimeMillis();
+        segment.updatePressures(inlet, outlet);
+
+        window.addLast(new double[]{now, outlet});
+        while (!window.isEmpty() && now - (long) window.peekFirst()[0] > WINDOW_MS) window.removeFirst();
+
+        double max = outlet;
+        for (double[] r : window) max = Math.max(max, r[1]);
+        double drop = max - outlet;
+
+        PipelineSensorLog.normal(inlet, outlet, drop);
+
+        boolean gradientBreach = drop > MAX_DROP_BAR;
+        boolean fractureBreach = outlet < CRITICAL_FLOOR && drop >= SUDDEN_DROP_BAR;
+        if (gradientBreach || fractureBreach) {
+            String why = String.format("Pressure fell %.2f bar within %d ms (outlet now %.2f bar)",
+                    drop, WINDOW_MS, outlet);
+            triggerEmergencyIsolation(why);                       // wake the actuator FIRST (fail-safe)
+            throw new PipelineBurstException(segment.getId(), drop, WINDOW_MS, why);
+        }
+    }
+
+    /** Sets the emergency flag and wakes every waiting actuator thread. */
+    public synchronized void triggerEmergencyIsolation(String why) {
+        if (emergency) return;                // idempotent
+        emergency = true;
+        reason = why;
+        detectedAtNanos = System.nanoTime();
+        notifyAll();
+    }
+
+    /** Actuator blocks here (wait) until an emergency is raised or the system shuts down. */
+    public synchronized boolean awaitEmergency() throws InterruptedException {
+        while (!emergency && !shutdown) {     // while-loop guards against spurious wakeups
+            wait();
+        }
+        return emergency;
+    }
+
+    /** Releases the actuator on normal termination so it never hangs forever. */
+    public synchronized void shutdown() { shutdown = true; notifyAll(); }
+
+    public synchronized boolean isEmergency()      { return emergency; }
+    public synchronized long getDetectedAtNanos()  { return detectedAtNanos; }
+    public synchronized String getReason()         { return reason; }
+}
+
+class PipelineSensorLog {
+    static void normal(double inlet, double outlet, double drop) {
+        PipelineSentinel.log(String.format("Reading: inlet=%.2f bar, outlet=%.2f bar, dP=%.2f, 2s-drop=%.2f bar",
+                inlet, outlet, inlet - outlet, drop));
+    }
+}
+
+/** Simulated pressure sensor: steady ~5.2 bar, then (optionally) a pipe fracture. */
+class PressureSensorThread extends Thread {
+    private static final double[] FRACTURE_PROFILE = {4.2, 3.0, 1.8, 1.8, 1.8};
+    private final PipelineMonitor monitor;
+    private final int fractureAtReading;
+    private final int maxReadings;
+    private final Random rnd = new Random(42);
+
+    PressureSensorThread(PipelineMonitor monitor, int fractureAtReading, int maxReadings) {
+        super("PressureSensor");
+        this.monitor = monitor;
+        this.fractureAtReading = fractureAtReading;
+        this.maxReadings = maxReadings;
+    }
+
+    @Override
+    public void run() {
+        try {
+            for (int i = 0; i < maxReadings; i++) {
+                double inlet = 5.2 + (rnd.nextDouble() - 0.5) * 0.06;
+                double outlet = inlet - 0.10;
+                if (fractureAtReading >= 0 && i >= fractureAtReading) {
+                    int k = Math.min(i - fractureAtReading, FRACTURE_PROFILE.length - 1);
+                    if (k == 0) PipelineSentinel.log("*** SIMULATED PIPE FRACTURE BEGINS ***");
+                    outlet = FRACTURE_PROFILE[k];
+                }
+                monitor.checkPressure(inlet, outlet);
+                Thread.sleep(200);
+            }
+            PipelineSentinel.log("Monitoring period finished, no anomalies.");
+        } catch (PipelineBurstException e) {
+            PipelineSentinel.log("!!! PipelineBurstException: " + e.getMessage()
+                    + " [segment=" + e.getSegmentId() + ", drop=" + String.format("%.2f", e.getPressureDropBar()) + " bar]");
+            PipelineSentinel.log("Sensor signalled actuator via notifyAll(); sensor stopping.");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            PipelineSentinel.log("Sensor interrupted.");
+        } finally {
+            monitor.shutdown();   // always release the actuator
+        }
+    }
+}
+
+/** Waits (wait/notify) for an emergency, then closes the valve in steps. */
+class ValveActuatorThread extends Thread {
+    private final PipelineMonitor monitor;
+    private final PipelineSegment segment;
+    private volatile long isolationTimeMs = -1;
+
+    ValveActuatorThread(PipelineMonitor monitor, PipelineSegment segment) {
+        super("ValveActuator");
+        this.monitor = monitor;
+        this.segment = segment;
+    }
+
+    public long getIsolationTimeMs() { return isolationTimeMs; }
+
+    @Override
+    public void run() {
+        try {
+            PipelineSentinel.log("Waiting for emergency signal (wait())...");
+            if (monitor.awaitEmergency()) {
+                PipelineSentinel.log("WOKEN by notify! Reason: " + monitor.getReason());
+                PipelineSentinel.log("Executing EMERGENCY VALVE CLOSURE...");
+                for (int pct = 80; pct >= 0; pct -= 20) {   // 100 -> 0 in 5 steps of 60 ms
+                    segment.setValveOpenPercent(pct);
+                    PipelineSentinel.log("Valve now " + pct + "% open");
+                    Thread.sleep(60);
+                }
+                isolationTimeMs = (System.nanoTime() - monitor.getDetectedAtNanos()) / 1_000_000;
+                PipelineSentinel.log("Segment ISOLATED. Closure took " + isolationTimeMs + " ms from detection.");
+            } else {
+                PipelineSentinel.log("Shutdown without emergency; actuator standing down.");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            // FAIL-SAFE: whatever happened, an emergency must end with a closed valve.
+            if (monitor.isEmergency() && segment.getValveOpenPercent() != 0) {
+                segment.setValveOpenPercent(0);
+                PipelineSentinel.log("FAIL-SAFE: valve force-closed in cleanup.");
+            }
+        }
+    }
+}
